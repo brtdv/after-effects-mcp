@@ -110,6 +110,8 @@ function createShapeLayer(args) {
         if (shapeType === "rectangle") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Rect");
             shapePathProperty.property("Size").setValue(size);
+            // Rounded corners, the shape equivalent of CSS border-radius.
+            if (args.roundness) { shapePathProperty.property("ADBE Vector Rect Roundness").setValue(args.roundness); }
         } else if (shapeType === "ellipse") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Ellipse");
             shapePathProperty.property("Size").setValue(size);
@@ -1092,6 +1094,382 @@ function deleteComposition(args) {
 }
 
 // =====================================================================
+// ===== buildComposition (Coachbox fork) ==============================
+// =====================================================================
+// Builds a whole scene (nested compositions of shape, text and path layers,
+// with keyframes) from one JSON spec. The bridge handles one command every
+// few seconds, so rebuilding a UI card layer by layer over the MCP would take
+// minutes and the caller could never be sure which layers exist yet. One spec
+// per scene keeps the build atomic: it lands completely or not at all.
+//
+// Coordinates follow the browser convention that the spec is generated from:
+// origin top-left, y down, sizes in comp pixels, times in seconds, colours as
+// "#rrggbb". Layer arrays are ordered bottom-to-top. A layer's `origin` is the
+// point (as fractions of its own box) that scale keyframes pivot around, the
+// same idea as CSS transform-origin.
+//
+// See README "build-composition" for the full spec format.
+
+function mcpHexToRgb(hex) {
+    var h = String(hex).replace("#", "");
+    if (h.length === 3) {
+        h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+    }
+    return [parseInt(h.substr(0, 2), 16) / 255, parseInt(h.substr(2, 2), 16) / 255, parseInt(h.substr(4, 2), 16) / 255];
+}
+
+function mcpReadJsonFile(path) {
+    var f = new File(path);
+    if (!f.exists) { throw new Error("Spec file not found: " + path); }
+    f.encoding = "UTF-8";
+    f.open("r");
+    var txt = f.read();
+    f.close();
+    return JSON.parse(txt);
+}
+
+// Finds or creates a folder; building the same scene twice must not leave
+// two folders with the same name behind.
+function mcpEnsureFolder(name, parent) {
+    parent = parent || app.project.rootFolder;
+    for (var i = 1; i <= parent.numItems; i++) {
+        var it = parent.item(i);
+        if (it instanceof FolderItem && it.name === name) { return it; }
+    }
+    return parent.items.addFolder(name);
+}
+
+function mcpClamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function mcpOrigin(L) {
+    var o = L.origin;
+    if (!o || o.length < 2) { return [0.5, 0.5]; }
+    return [o[0], o[1]];
+}
+
+// Places a layer so that its box's top-left sits at (L.x, L.y) while the
+// anchor point sits at the origin fraction. The box itself must already be
+// drawn with its top-left at the layer's local (0,0).
+function mcpPlaceBox(layer, L) {
+    var o = mcpOrigin(L);
+    var w = L.w || 0, h = L.h || 0;
+    var tg = layer.property("ADBE Transform Group");
+    tg.property("ADBE Anchor Point").setValue([w * o[0], h * o[1]]);
+    tg.property("ADBE Position").setValue([L.x + w * o[0], L.y + h * o[1]]);
+}
+
+function mcpAddStroke(contents, s) {
+    var stroke = contents.addProperty("ADBE Vector Graphic - Stroke");
+    stroke.property("ADBE Vector Stroke Color").setValue(mcpHexToRgb(s.color || "#000000"));
+    stroke.property("ADBE Vector Stroke Width").setValue(s.width || 1);
+    stroke.property("ADBE Vector Stroke Opacity").setValue(s.opacity === undefined ? 100 : s.opacity);
+    // 1 = butt/miter, 2 = round, 3 = square/bevel
+    if (s.cap === "round") { stroke.property("ADBE Vector Stroke Line Cap").setValue(2); }
+    else if (s.cap === "square") { stroke.property("ADBE Vector Stroke Line Cap").setValue(3); }
+    if (s.join === "round") { stroke.property("ADBE Vector Stroke Line Join").setValue(2); }
+    else if (s.join === "bevel") { stroke.property("ADBE Vector Stroke Line Join").setValue(3); }
+    return stroke;
+}
+
+function mcpAddFill(contents, color, opacity, rule) {
+    var fill = contents.addProperty("ADBE Vector Graphic - Fill");
+    fill.property("ADBE Vector Fill Color").setValue(mcpHexToRgb(color));
+    fill.property("ADBE Vector Fill Opacity").setValue(opacity === undefined ? 100 : opacity);
+    // 1 = non-zero winding, 2 = even-odd; matches the SVG fill-rule names.
+    if (rule === "evenodd") { fill.property("ADBE Vector Fill Rule").setValue(2); }
+    return fill;
+}
+
+// Within a shape group, an item lower in the list renders underneath and a
+// fill/stroke applies to the paths above it. Adding path, then stroke, then
+// fill therefore gives "stroke on top of fill", which is what a CSS border
+// looks like.
+function mcpBuildRect(comp, L) {
+    var layer = comp.layers.addShape();
+    var w = L.w, h = L.h;
+    var group = layer.property("ADBE Root Vectors Group").addProperty("ADBE Vector Group");
+    var contents = group.property("ADBE Vectors Group");
+    if (L.type === "ellipse") {
+        var ell = contents.addProperty("ADBE Vector Shape - Ellipse");
+        ell.property("ADBE Vector Ellipse Size").setValue([w, h]);
+        ell.property("ADBE Vector Ellipse Position").setValue([w / 2, h / 2]);
+    } else {
+        var rect = contents.addProperty("ADBE Vector Shape - Rect");
+        rect.property("ADBE Vector Rect Size").setValue([w, h]);
+        rect.property("ADBE Vector Rect Position").setValue([w / 2, h / 2]);
+        if (L.roundness) { rect.property("ADBE Vector Rect Roundness").setValue(L.roundness); }
+    }
+    if (L.stroke) { mcpAddStroke(contents, L.stroke); }
+    if (L.fill) { mcpAddFill(contents, L.fill, L.fillOpacity); }
+    mcpPlaceBox(layer, L);
+    return layer;
+}
+
+function mcpBuildPath(comp, L) {
+    var layer = comp.layers.addShape();
+    var root = layer.property("ADBE Root Vectors Group");
+    var shapes = L.shapes || [];
+    // Groups added later end up lower in the list, so add them in reverse
+    // to keep the spec's bottom-to-top order.
+    for (var s = shapes.length - 1; s >= 0; s--) {
+        var sh = shapes[s];
+        var group = root.addProperty("ADBE Vector Group");
+        var contents = group.property("ADBE Vectors Group");
+        var paths = sh.paths || [];
+        for (var p = 0; p < paths.length; p++) {
+            var pd = paths[p];
+            var shape = new Shape();
+            shape.vertices = pd.vertices;
+            shape.inTangents = pd.inTangents;
+            shape.outTangents = pd.outTangents;
+            shape.closed = pd.closed !== false;
+            contents.addProperty("ADBE Vector Shape - Group").property("ADBE Vector Shape").setValue(shape);
+        }
+        if (sh.stroke) { mcpAddStroke(contents, sh.stroke); }
+        if (sh.fill) { mcpAddFill(contents, sh.fill, sh.fillOpacity, sh.fillRule); }
+    }
+    mcpPlaceBox(layer, L);
+    return layer;
+}
+
+function mcpBuildText(comp, L) {
+    var text = String(L.text).replace(/\n/g, "\r");
+    var layer = comp.layers.addText(text);
+    var tp = layer.property("ADBE Text Properties").property("ADBE Text Document");
+    var td = tp.value;
+    td.font = L.font || "Inter-Regular";
+    td.fontSize = L.size || 12;
+    td.applyFill = true;
+    td.fillColor = mcpHexToRgb(L.color || "#000000");
+    td.applyStroke = false;
+    if (L.tracking !== undefined) { td.tracking = L.tracking; }
+    if (L.leading) { td.autoLeading = false; td.leading = L.leading; }
+    if (L.align === "center") { td.justification = ParagraphJustification.CENTER_JUSTIFY; }
+    else if (L.align === "right") { td.justification = ParagraphJustification.RIGHT_JUSTIFY; }
+    else { td.justification = ParagraphJustification.LEFT_JUSTIFY; }
+    tp.setValue(td);
+    // Point text anchors at the start of the first baseline, which is why the
+    // spec carries a baseline instead of a box top for text.
+    layer.property("ADBE Transform Group").property("ADBE Position").setValue([L.x, L.baseline]);
+    return layer;
+}
+
+function mcpBuildPrecomp(comp, L, ctx) {
+    var sub = mcpBuildCompFromSpec(L.comp, ctx, ctx.partsFolder);
+    var layer = comp.layers.add(sub);
+    // Collapse transformations keeps vector edges crisp when the parent is
+    // scaled or viewed through a 3D camera.
+    layer.collapseTransformations = true;
+    mcpPlaceBox(layer, L);
+    return layer;
+}
+
+function mcpAddDropShadow(layer, s) {
+    var fx = layer.property("ADBE Effect Parade").addProperty("ADBE Drop Shadow");
+    fx.property("Shadow Color").setValue(mcpHexToRgb(s.color || "#000000"));
+    var op = fx.property("Opacity");
+    var v = s.opacity === undefined ? 50 : s.opacity;
+    // Drop Shadow stores opacity on a 0-255 scale in scripting while the UI
+    // shows percent; maxValue tells which one this AE version uses.
+    if (op.maxValue > 100) { v = v * 255 / 100; }
+    op.setValue(v);
+    var dx = s.dx || 0, dy = s.dy || 0;
+    // AE measures direction clockwise from twelve o'clock; CSS offsets are x
+    // right, y down, so straight down (dx 0, dy 1) becomes 180 degrees.
+    var angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+    fx.property("Direction").setValue(angle);
+    fx.property("Distance").setValue(Math.sqrt(dx * dx + dy * dy));
+    fx.property("Softness").setValue(s.blur || 0);
+}
+
+function mcpAddEffects(layer, effects) {
+    for (var i = 0; i < effects.length; i++) {
+        var e = effects[i];
+        var fx = layer.property("ADBE Effect Parade").addProperty(e.matchName);
+        if (e.name) { fx.name = e.name; }
+        var props = e.props || {};
+        for (var key in props) {
+            if (props.hasOwnProperty(key)) { fx.property(key).setValue(props[key]); }
+        }
+    }
+}
+
+// Converts one CSS cubic-bezier easing into After Effects speed/influence
+// handles for the segment between two keyframes. The CSS control point
+// (x1, y1) is a fraction of the segment's duration and value change; AE
+// wants the same handle as an influence percentage (x1) and a slope (y1/x1
+// times the average speed). Mirrored for the incoming handle at the end.
+function mcpApplyEase(prop, ease) {
+    var spatial = (prop.propertyValueType === PropertyValueType.TwoD_SPATIAL || prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL);
+    var x1 = mcpClamp(ease[0], 0.01, 1), y1 = ease[1], x2 = mcpClamp(ease[2], 0, 0.99), y2 = ease[3];
+    var n = prop.numKeys;
+    for (var k = 1; k <= n; k++) {
+        prop.setInterpolationTypeAtKey(k, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER);
+    }
+    for (var k = 1; k < n; k++) {
+        var t0 = prop.keyTime(k), t1 = prop.keyTime(k + 1);
+        var v0 = prop.keyValue(k), v1 = prop.keyValue(k + 1);
+        var avgs = [];
+        if (spatial) {
+            var sum = 0;
+            for (var d = 0; d < v0.length; d++) { sum += (v1[d] - v0[d]) * (v1[d] - v0[d]); }
+            avgs.push(Math.sqrt(sum) / (t1 - t0));
+        } else if (typeof v0 === "number") {
+            avgs.push((v1 - v0) / (t1 - t0));
+        } else {
+            for (var d = 0; d < v0.length; d++) { avgs.push((v1[d] - v0[d]) / (t1 - t0)); }
+        }
+        var outEase = [], inEase = [];
+        for (var i = 0; i < avgs.length; i++) {
+            outEase.push(new KeyframeEase(y1 / x1 * avgs[i], mcpClamp(x1 * 100, 0.1, 100)));
+            inEase.push(new KeyframeEase((1 - y2) / (1 - x2) * avgs[i], mcpClamp((1 - x2) * 100, 0.1, 100)));
+        }
+        var firstIn = (k === 1) ? outEase : prop.keyInTemporalEase(k);
+        prop.setTemporalEaseAtKey(k, firstIn, outEase);
+        prop.setTemporalEaseAtKey(k + 1, inEase, inEase);
+    }
+    if (spatial) {
+        // Auto-bezier spatial tangents would bow a straight slide into a
+        // curve; a CSS translate moves in a straight line.
+        var zero = [];
+        for (var d = 0; d < prop.keyValue(1).length; d++) { zero.push(0); }
+        for (var k = 1; k <= n; k++) { prop.setSpatialTangentsAtKey(k, zero, zero); }
+    }
+}
+
+function mcpBuildAnim(layer, a, ctx) {
+    var tg = layer.property("ADBE Transform Group");
+    var prop;
+    if (a.prop === "opacity") { prop = tg.property("ADBE Opacity"); }
+    else if (a.prop === "position") { prop = tg.property("ADBE Position"); }
+    else if (a.prop === "scale") { prop = tg.property("ADBE Scale"); }
+    else { throw new Error("Unknown animated property '" + a.prop + "' on layer " + layer.name); }
+    var base = prop.value;
+    var keys = a.keys || [];
+    for (var i = 0; i < keys.length; i++) {
+        var t = keys[i][0] * ctx.timeScale + ctx.timeOffset;
+        var v = keys[i][1];
+        if (a.prop === "position") {
+            // Keys carry offsets from the layout position, so the same
+            // animation works wherever the layer ends up.
+            var pv = [base[0] + v[0], base[1] + v[1]];
+            if (base.length > 2) { pv.push(base[2]); }
+            v = pv;
+        } else if (a.prop === "scale") {
+            var sv = [v[0] * 100, v[1] * 100];
+            if (base.length > 2) { sv.push(100); }
+            v = sv;
+        }
+        prop.setValueAtTime(t, v);
+    }
+    if (a.ease && keys.length > 1) { mcpApplyEase(prop, a.ease); }
+}
+
+function mcpApplyCommon(layer, L, ctx) {
+    if (L.name) { layer.name = L.name; }
+    if (L.label !== undefined) { layer.label = mcpResolveLabel(L.label); }
+    if (L.comment) { layer.comment = L.comment; }
+    if (L.opacity !== undefined) { layer.property("ADBE Transform Group").property("ADBE Opacity").setValue(L.opacity); }
+    if (L.shadow) { mcpAddDropShadow(layer, L.shadow); }
+    if (L.effects) { mcpAddEffects(layer, L.effects); }
+    var anims = L.anim || [];
+    for (var i = 0; i < anims.length; i++) { mcpBuildAnim(layer, anims[i], ctx); }
+    ctx.layerCount++;
+}
+
+function mcpBuildCompFromSpec(spec, ctx, folder) {
+    if (!spec || !spec.name) { throw new Error("Every comp in the spec needs a name"); }
+    if (mcpFindProjectItem(spec.name, "comp")) {
+        throw new Error("A composition named '" + spec.name + "' already exists; delete it first so names stay unique");
+    }
+    var w = Math.max(4, Math.round(spec.width)), h = Math.max(4, Math.round(spec.height));
+    var comp = app.project.items.addComp(spec.name, w, h, 1, ctx.duration, ctx.frameRate);
+    if (folder) { comp.parentFolder = folder; }
+    if (spec.bgColor) { comp.bgColor = mcpHexToRgb(spec.bgColor); }
+    if (spec.label !== undefined) { comp.label = mcpResolveLabel(spec.label); }
+    if (spec.comment) { comp.comment = spec.comment; }
+    ctx.compCount++;
+    var layers = spec.layers || [];
+    // Each new layer lands on top, so walking the spec bottom-to-top
+    // reproduces its stacking order.
+    for (var i = 0; i < layers.length; i++) {
+        var L = layers[i];
+        var layer;
+        if (L.type === "rect" || L.type === "ellipse") { layer = mcpBuildRect(comp, L); }
+        else if (L.type === "path") { layer = mcpBuildPath(comp, L); }
+        else if (L.type === "text") { layer = mcpBuildText(comp, L); }
+        else if (L.type === "comp") { layer = mcpBuildPrecomp(comp, L, ctx); }
+        else { throw new Error("Unknown layer type '" + L.type + "' in comp " + spec.name); }
+        mcpApplyCommon(layer, L, ctx);
+    }
+    return comp;
+}
+
+// Collects every comp name a spec would create, so a rebuild can clear
+// exactly those and nothing else in the project.
+function mcpCollectCompNames(compSpec, names) {
+    names.push(compSpec.name);
+    var layers = compSpec.layers || [];
+    for (var i = 0; i < layers.length; i++) {
+        if (layers[i].type === "comp" && layers[i].comp) { mcpCollectCompNames(layers[i].comp, names); }
+    }
+    return names;
+}
+
+function mcpRemoveComps(names) {
+    var removed = 0;
+    for (var i = app.project.numItems; i >= 1; i--) {
+        var it = app.project.item(i);
+        if (!(it instanceof CompItem)) { continue; }
+        for (var n = 0; n < names.length; n++) {
+            if (it.name === names[n]) { it.remove(); removed++; break; }
+        }
+    }
+    return removed;
+}
+
+function buildComposition(args) {
+    try {
+        var spec = args.spec;
+        if (!spec && args.specFile) { spec = mcpReadJsonFile(args.specFile); }
+        if (!spec) { throw new Error("Pass either spec (object) or specFile (path to a JSON file)"); }
+        if (!spec.comp) { throw new Error("spec.comp is required"); }
+        var removed = 0;
+        if (args.replace) {
+            // Iterating on a build means running it again and again; without
+            // replace every run would stop on "name already exists".
+            removed = mcpRemoveComps(mcpCollectCompNames(spec.comp, []));
+        }
+        var ctx = {
+            frameRate: spec.frameRate || 60,
+            duration: spec.duration || 5,
+            timeOffset: spec.timeOffset || 0,
+            timeScale: spec.timeScale || 1,
+            compCount: 0,
+            layerCount: 0,
+            partsFolder: null
+        };
+        app.beginUndoGroup("Build composition " + spec.comp.name);
+        var folder = null;
+        if (spec.folder) { folder = mcpEnsureFolder(spec.folder); }
+        if (spec.partsFolder) { ctx.partsFolder = mcpEnsureFolder(spec.partsFolder, folder); }
+        var comp = mcpBuildCompFromSpec(spec.comp, ctx, folder);
+        app.endUndoGroup();
+        comp.openInViewer();
+        return JSON.stringify({
+            status: "success",
+            message: "Built " + ctx.compCount + " composition(s) with " + ctx.layerCount + " layer(s)",
+            comp: comp.name,
+            compositions: ctx.compCount,
+            layers: ctx.layerCount,
+            replaced: removed
+        }, null, 2);
+    } catch (error) {
+        try { app.endUndoGroup(); } catch (e) {}
+        return JSON.stringify({ status: "error", message: error.toString(), line: error.line }, null, 2);
+    }
+}
+
 // ===== Project organisation commands (Coachbox fork) =================
 // =====================================================================
 // These exist so an AI assistant can leave a project as tidy as a human would:
@@ -2780,6 +3158,9 @@ function executeCommand(command, args, commandId) {
                 logToPanel("Calling setRenderer function...");
                 result = setRenderer(args);
                 logToPanel("Returned from setRenderer.");
+                break;
+            case "buildComposition":
+                result = buildComposition(args);
                 break;
             case "createFolder":
                 result = createFolder(args);

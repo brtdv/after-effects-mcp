@@ -1819,6 +1819,12 @@ function queueTool(toolName: string, command: string, description: string, schem
   });
 }
 
+queueTool("build-composition", "buildComposition", "Build a whole scene (nested compositions of rect, ellipse, path and text layers with keyframes) from one JSON spec, in a single command. Pass specFile (path to a JSON file) for anything bigger than a few layers. See README 'build-composition' for the spec format.", {
+  specFile: z.string().optional().describe("Absolute path to a JSON spec file. Preferred: specs run into hundreds of layers."),
+  spec: z.record(z.string(), z.unknown()).optional().describe("The spec inline, for small scenes."),
+  replace: z.boolean().optional().describe("Remove compositions with the same names first, so a rebuild does not fail on duplicates.")
+});
+
 queueTool("create-folder", "createFolder", "Create a folder in the project panel. Returns the existing folder if one with that name already exists in the same parent.", {
   name: z.string().describe("Folder name, e.g. '01 Reels'."),
   parentFolder: z.string().optional().describe("Name of an existing folder to create it in. Omit for the project root.")

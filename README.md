@@ -302,6 +302,43 @@ You can animate layers with:
 | `rename-layer`              | Rename a layer                         |
 | `rename-item`               | Rename a comp, footage or folder       |
 | `list-project-items`        | List items with folder path and label  |
+| `build-composition`         | Build a whole scene from one JSON spec (see below) |
+
+### 🏗 build-composition: a whole scene from one spec
+
+Building a UI card layer by layer over the bridge takes minutes (one command every few seconds) and leaves the caller guessing which layers already exist. `build-composition` takes one JSON spec and builds every composition, layer and keyframe in a single undo group. Pass `specFile` (absolute path) for anything beyond a handful of layers; `replace: true` removes compositions with the same names first so a rebuild does not fail on duplicates.
+
+Coordinates follow the browser convention the spec is usually generated from: origin top-left, y down, sizes in comp pixels, times in seconds, colours as `#rrggbb`. Layers are listed bottom-to-top. `origin` is the point (fractions of the layer's own box) that scale keyframes pivot around, like CSS `transform-origin`.
+
+```json
+{
+  "frameRate": 60, "duration": 3, "timeOffset": 0.5, "timeScale": 1,
+  "folder": "02 Bouwstenen", "partsFolder": "PRE_card_parts",
+  "comp": {
+    "name": "PRE_card", "width": 800, "height": 400, "comment": "why this exists",
+    "layers": [
+      { "type": "rect", "name": "SHP card", "x": 0, "y": 0, "w": 800, "h": 400, "roundness": 16,
+        "fill": "#ffffff", "stroke": { "color": "#e6e6e6", "width": 4 },
+        "shadow": { "color": "#000000", "opacity": 10, "dx": 0, "dy": 4, "blur": 12 } },
+      { "type": "text", "name": "TXT title", "x": 40, "baseline": 90, "text": "Group swim",
+        "font": "Inter-SemiBold", "size": 40, "color": "#000000", "tracking": 0, "label": "orange" },
+      { "type": "path", "name": "SHP icon", "x": 700, "y": 40, "w": 44, "h": 44,
+        "shapes": [ { "paths": [ { "vertices": [[0,0],[44,0],[44,44]], "inTangents": [[0,0],[0,0],[0,0]], "outTangents": [[0,0],[0,0],[0,0]], "closed": true } ],
+                      "fill": "#333333", "fillRule": "nonzero", "stroke": { "color": "#000000", "width": 2, "cap": "round", "join": "round" } } ] },
+      { "type": "comp", "name": "PRE row", "x": 40, "y": 140, "w": 720, "h": 60, "origin": [0, 0.5],
+        "comp": { "name": "PRE_card__row-1", "width": 720, "height": 60, "layers": [] },
+        "anim": [
+          { "prop": "opacity", "ease": [0.22, 1, 0.36, 1], "keys": [[0.18, 0], [0.6, 100]] },
+          { "prop": "position", "ease": [0.22, 1, 0.36, 1], "keys": [[0.18, [0, 16]], [0.6, [0, 0]]] },
+          { "prop": "scale", "keys": [[0.2, [0, 1]], [0.9, [1, 1]]] }
+        ],
+        "effects": [ { "matchName": "ADBE Venetian Blinds", "props": { "Transition Completion": 50, "Direction": 45, "Width": 16 } } ] }
+    ]
+  }
+}
+```
+
+Layer types: `rect` and `ellipse` (`fill`, `fillOpacity`, `stroke`, `roundness`), `path` (a list of `shapes`, each with cubic-bezier `paths` in the layer's own coordinates plus its own fill/stroke), `text` (point text anchored at the start of its first `baseline`; `leading` and `align` optional) and `comp` (a nested composition placed as a precomp, with `collapseTransformations` on). Every layer accepts `name`, `label`, `comment`, `opacity`, `shadow`, `effects` and `anim`. Position keys are offsets from the layout position; scale keys are factors (1 = 100%). `ease` is a CSS `cubic-bezier` quadruple; it becomes speed/influence handles on the keyframes. `timeScale` stretches every key time, `timeOffset` shifts them.
 
 > ℹ️ Output format for `render-video` is determined by the chosen output module template (or the default one); on some installs the default is H.264 (.mp4). `save-frame` is handy for letting an AI assistant inspect the rendered result.
 
