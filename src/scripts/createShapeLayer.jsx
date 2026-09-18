@@ -53,6 +53,8 @@ function createShapeLayer(args) {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Rect");
             var rectSizeProp = shapePathProperty.property("Size");
             rectSizeProp.setValue(size);
+            // Rounded corners, the shape equivalent of CSS border-radius.
+            if (args.roundness) { shapePathProperty.property("ADBE Vector Rect Roundness").setValue(args.roundness); }
         } else if (shapeType === "ellipse") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Ellipse");
             var ellipseSizeProp = shapePathProperty.property("Size");
