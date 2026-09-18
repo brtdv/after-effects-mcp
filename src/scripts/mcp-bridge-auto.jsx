@@ -1373,7 +1373,10 @@ function mcpApplyCommon(layer, L, ctx) {
     if (L.shadow) { mcpAddDropShadow(layer, L.shadow); }
     if (L.effects) { mcpAddEffects(layer, L.effects); }
     var anims = L.anim || [];
-    for (var i = 0; i < anims.length; i++) { mcpBuildAnim(layer, anims[i], ctx); }
+    for (var i = 0; i < anims.length; i++) {
+        mcpBuildAnim(layer, anims[i], ctx);
+        if (ctx.motionBlur && anims[i].prop !== "opacity") { layer.motionBlur = true; }
+    }
     ctx.layerCount++;
 }
 
@@ -1384,6 +1387,9 @@ function mcpBuildCompFromSpec(spec, ctx, folder) {
     }
     var w = Math.max(4, Math.round(spec.width)), h = Math.max(4, Math.round(spec.height));
     var comp = app.project.items.addComp(spec.name, w, h, 1, ctx.duration, ctx.frameRate);
+    // Motion blur on by default: UI elements sliding in without it look
+    // like a screen recording, not like footage.
+    comp.motionBlur = ctx.motionBlur;
     if (folder) { comp.parentFolder = folder; }
     if (spec.bgColor) { comp.bgColor = mcpHexToRgb(spec.bgColor); }
     if (spec.label !== undefined) { comp.label = mcpResolveLabel(spec.label); }
@@ -1445,6 +1451,7 @@ function buildComposition(args) {
             duration: spec.duration || 5,
             timeOffset: spec.timeOffset || 0,
             timeScale: spec.timeScale || 1,
+            motionBlur: spec.motionBlur !== false,
             compCount: 0,
             layerCount: 0,
             partsFolder: null
