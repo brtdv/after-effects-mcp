@@ -241,7 +241,15 @@ server.tool(
       "addTextAnimator",
       "saveProject",
       "getLayerDetails",
-      "deleteComposition"
+      "deleteComposition",
+      "createFolder",
+      "moveItemToFolder",
+      "setItemLabel",
+      "setLayerLabel",
+      "setLayerComment",
+      "renameLayer",
+      "renameItem",
+      "listProjectItems"
     ];
     
     if (!allowedScripts.includes(script)) {
@@ -1779,6 +1787,74 @@ server.tool(
     };
   }
 );
+
+// --- Project organisation tools (Coachbox fork) ---
+// Folders, labels, comments and renaming: everything needed to leave a project as
+// tidy as a human would, instead of only being able to create things.
+
+const LabelSchema = z.union([
+  z.number().int().min(0).max(16),
+  z.enum(["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "seafoam", "blue", "green", "purple", "orange", "brown", "fuchsia", "cyan", "sandstone", "darkgreen"])
+]).describe("Label colour: 0-16 or a default After Effects label name (0/none clears it).");
+
+const LayerTargetSchema = {
+  compName: z.string().optional().describe("Name of the composition. Defaults to the active composition if omitted."),
+  layerIndex: z.number().int().positive().optional().describe("1-based index of the layer (use this or layerName)."),
+  layerName: z.string().optional().describe("Name of the layer (use this or layerIndex).")
+};
+
+function queueTool(toolName: string, command: string, description: string, schema: Record<string, z.ZodTypeAny>) {
+  server.tool(toolName, description, schema, async (params) => {
+    try {
+      writeCommandFile(command, params);
+      return {
+        content: [{ type: "text", text: `Command '${toolName}' has been queued. Use the "get-results" tool after a few seconds to check results.` }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error queuing ${toolName}: ${String(error)}` }],
+        isError: true
+      };
+    }
+  });
+}
+
+queueTool("create-folder", "createFolder", "Create a folder in the project panel. Returns the existing folder if one with that name already exists in the same parent.", {
+  name: z.string().describe("Folder name, e.g. '01 Reels'."),
+  parentFolder: z.string().optional().describe("Name of an existing folder to create it in. Omit for the project root.")
+});
+
+queueTool("move-item-to-folder", "moveItemToFolder", "Move a composition, footage item or folder into a project folder.", {
+  itemName: z.string().describe("Name of the composition, footage item or folder to move."),
+  folderName: z.string().optional().describe("Name of the destination folder. Omit to move the item to the project root.")
+});
+
+queueTool("set-item-label", "setItemLabel", "Set the label colour of a project item (composition, footage or folder).", {
+  itemName: z.string().describe("Name of the project item."),
+  label: LabelSchema
+});
+
+queueTool("set-layer-label", "setLayerLabel", "Set the label colour of a layer in a composition.", {
+  ...LayerTargetSchema,
+  label: LabelSchema
+});
+
+queueTool("set-layer-comment", "setLayerComment", "Set the Comment column of a layer. Use it to explain why a layer exists or what depends on it.", {
+  ...LayerTargetSchema,
+  comment: z.string().describe("Comment text. Pass an empty string to clear it.")
+});
+
+queueTool("rename-layer", "renameLayer", "Rename a layer in a composition.", {
+  ...LayerTargetSchema,
+  newName: z.string().describe("The new layer name.")
+});
+
+queueTool("rename-item", "renameItem", "Rename a composition, footage item or folder in the project panel.", {
+  itemName: z.string().describe("Current name of the project item."),
+  newName: z.string().describe("The new name.")
+});
+
+queueTool("list-project-items", "listProjectItems", "List every project item with its type, folder path and label colour. Use it to check whether the project is tidy.", {});
 
 // --- Community-contributed tools (ported into this bundle) ---
 // remove-keyframe: ported from PR #28 by @dellis23

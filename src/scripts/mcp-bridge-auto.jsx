@@ -1091,6 +1091,197 @@ function deleteComposition(args) {
     }
 }
 
+// =====================================================================
+// ===== Project organisation commands (Coachbox fork) =================
+// =====================================================================
+// These exist so an AI assistant can leave a project as tidy as a human would:
+// named layers, items in folders, label colours and layer comments. Without them
+// the assistant can only create things, never file them away.
+
+// After Effects label colours by index, as shown in Settings > Labels with the
+// default names. 0 means "no label".
+var MCP_LABEL_NAMES = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "seafoam",
+    "blue", "green", "purple", "orange", "brown", "fuchsia", "cyan", "sandstone", "darkgreen"];
+
+function mcpResolveLabel(label) {
+    if (typeof label === "number") {
+        if (label < 0 || label > 16) { throw new Error("Label index must be between 0 and 16"); }
+        return label;
+    }
+    var wanted = String(label).toLowerCase().replace(/[\s_-]/g, "");
+    for (var i = 0; i < MCP_LABEL_NAMES.length; i++) {
+        if (MCP_LABEL_NAMES[i] === wanted) { return i; }
+    }
+    throw new Error("Unknown label '" + label + "'. Use 0-16 or one of: " + MCP_LABEL_NAMES.join(", "));
+}
+
+// Find a project item (composition, footage or folder) by name. Names are the only
+// handle the assistant has, so an ambiguous name is an error rather than a guess.
+function mcpFindProjectItem(name, kind) {
+    var matches = [];
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if (it.name !== name) { continue; }
+        if (kind === "folder" && !(it instanceof FolderItem)) { continue; }
+        if (kind === "comp" && !(it instanceof CompItem)) { continue; }
+        if (kind === "footage" && !(it instanceof FootageItem)) { continue; }
+        matches.push(it);
+    }
+    if (matches.length > 1) { throw new Error("Several items are named '" + name + "'; rename them so the name is unique"); }
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function mcpItemKind(it) {
+    if (it instanceof CompItem) { return "Composition"; }
+    if (it instanceof FolderItem) { return "Folder"; }
+    if (it instanceof FootageItem) { return "Footage"; }
+    return "Unknown";
+}
+
+function mcpFolderPath(it) {
+    var parts = [];
+    var f = it.parentFolder;
+    while (f && f !== app.project.rootFolder) {
+        parts.unshift(f.name);
+        f = f.parentFolder;
+    }
+    return parts.join("/");
+}
+
+// --- createFolder: create a folder in the project panel (idempotent) ---
+function createFolder(args) {
+    try {
+        var name = args.name;
+        if (!name) { throw new Error("name is required"); }
+        var parent = app.project.rootFolder;
+        if (args.parentFolder) {
+            parent = mcpFindProjectItem(args.parentFolder, "folder");
+            if (!parent) { throw new Error("Parent folder not found: " + args.parentFolder); }
+        }
+        // Reuse an existing folder with that name in the same parent, so calling this
+        // twice (or on a project built from the template) never creates duplicates.
+        for (var i = 1; i <= parent.numItems; i++) {
+            var existing = parent.item(i);
+            if (existing instanceof FolderItem && existing.name === name) {
+                return JSON.stringify({ status: "success", message: "Folder already exists", folder: { id: existing.id, name: existing.name, path: mcpFolderPath(existing) }, created: false }, null, 2);
+            }
+        }
+        var folder = parent.items.addFolder(name);
+        return JSON.stringify({ status: "success", message: "Folder created", folder: { id: folder.id, name: folder.name, path: mcpFolderPath(folder) }, created: true }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- moveItemToFolder: put a composition, footage item or folder into a folder ---
+function moveItemToFolder(args) {
+    try {
+        var item = mcpFindProjectItem(args.itemName);
+        if (!item) { throw new Error("Item not found: " + args.itemName); }
+        var target = app.project.rootFolder;
+        if (args.folderName) {
+            target = mcpFindProjectItem(args.folderName, "folder");
+            if (!target) { throw new Error("Folder not found: " + args.folderName); }
+        }
+        if (item === target) { throw new Error("Cannot move a folder into itself"); }
+        item.parentFolder = target;
+        return JSON.stringify({ status: "success", message: "Item moved", item: { id: item.id, name: item.name, type: mcpItemKind(item), path: mcpFolderPath(item) } }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- setItemLabel: label colour of a project item (composition, footage, folder) ---
+function setItemLabel(args) {
+    try {
+        var item = mcpFindProjectItem(args.itemName);
+        if (!item) { throw new Error("Item not found: " + args.itemName); }
+        var idx = mcpResolveLabel(args.label);
+        item.label = idx;
+        return JSON.stringify({ status: "success", message: "Item label set", item: item.name, label: idx, labelName: MCP_LABEL_NAMES[idx] }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- setLayerLabel: label colour of a layer ---
+function setLayerLabel(args) {
+    try {
+        var comp = mcpFindComp(args.compName || "");
+        if (!comp) { throw new Error("Composition not found"); }
+        var layer = mcpFindLayer(comp, args.layerIndex, args.layerName);
+        if (!layer) { throw new Error("Layer not found"); }
+        var idx = mcpResolveLabel(args.label);
+        layer.label = idx;
+        return JSON.stringify({ status: "success", message: "Layer label set", layer: layer.name, label: idx, labelName: MCP_LABEL_NAMES[idx] }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- setLayerComment: the Comment column in the timeline ---
+function setLayerComment(args) {
+    try {
+        var comp = mcpFindComp(args.compName || "");
+        if (!comp) { throw new Error("Composition not found"); }
+        var layer = mcpFindLayer(comp, args.layerIndex, args.layerName);
+        if (!layer) { throw new Error("Layer not found"); }
+        layer.comment = args.comment || "";
+        return JSON.stringify({ status: "success", message: "Layer comment set", layer: layer.name, comment: layer.comment }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- renameLayer ---
+function renameLayer(args) {
+    try {
+        var comp = mcpFindComp(args.compName || "");
+        if (!comp) { throw new Error("Composition not found"); }
+        var layer = mcpFindLayer(comp, args.layerIndex, args.layerName);
+        if (!layer) { throw new Error("Layer not found"); }
+        if (!args.newName) { throw new Error("newName is required"); }
+        var oldName = layer.name;
+        layer.name = args.newName;
+        return JSON.stringify({ status: "success", message: "Layer renamed", oldName: oldName, newName: layer.name, layerIndex: layer.index }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- renameItem: rename a composition, footage item or folder ---
+function renameItem(args) {
+    try {
+        var item = mcpFindProjectItem(args.itemName);
+        if (!item) { throw new Error("Item not found: " + args.itemName); }
+        if (!args.newName) { throw new Error("newName is required"); }
+        var oldName = item.name;
+        item.name = args.newName;
+        return JSON.stringify({ status: "success", message: "Item renamed", oldName: oldName, newName: item.name, type: mcpItemKind(item) }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- listProjectItems: every item with its folder path and label, so the assistant
+// can check whether the project is filed away properly ---
+function listProjectItems(args) {
+    try {
+        var items = [];
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var it = app.project.item(i);
+            var entry = { id: it.id, name: it.name, type: mcpItemKind(it), path: mcpFolderPath(it), label: it.label, labelName: MCP_LABEL_NAMES[it.label] };
+            if (it instanceof CompItem) {
+                entry.width = it.width; entry.height = it.height; entry.duration = it.duration; entry.numLayers = it.numLayers;
+            }
+            items.push(entry);
+        }
+        return JSON.stringify({ status: "success", count: items.length, items: items }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // ===== Community-contributed bridge functions (ported into this bundle) ==========
 // removeKeyframe — ported from PR #28 by @dellis23
 //   https://github.com/Dakkshin/after-effects-mcp/pull/28
@@ -2589,6 +2780,30 @@ function executeCommand(command, args, commandId) {
                 logToPanel("Calling setRenderer function...");
                 result = setRenderer(args);
                 logToPanel("Returned from setRenderer.");
+                break;
+            case "createFolder":
+                result = createFolder(args);
+                break;
+            case "moveItemToFolder":
+                result = moveItemToFolder(args);
+                break;
+            case "setItemLabel":
+                result = setItemLabel(args);
+                break;
+            case "setLayerLabel":
+                result = setLayerLabel(args);
+                break;
+            case "setLayerComment":
+                result = setLayerComment(args);
+                break;
+            case "renameLayer":
+                result = renameLayer(args);
+                break;
+            case "renameItem":
+                result = renameItem(args);
+                break;
+            case "listProjectItems":
+                result = listProjectItems(args);
                 break;
             default:
                 result = JSON.stringify({ error: "Unknown command: " + command });
