@@ -221,7 +221,10 @@ server.tool(
       "setCompositionProperties",
       "duplicateLayer",
       "deleteLayer",
-      "setLayerMask"
+      "setLayerMask",
+      "importFootage",
+      "moveLayer",
+      "evalScript"
     ];
     
     if (!allowedScripts.includes(script)) {

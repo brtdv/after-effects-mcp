@@ -12,7 +12,7 @@
 
 // --- Function Definitions ---
 
-// --- createComposition (from createComposition.jsx) --- 
+// --- createComposition (from createComposition.jsx) ---
 function createComposition(args) {
     try {
         var name = args.name || "New Composition";
@@ -450,6 +450,118 @@ function createSolidLayer(args) {
     }
 }
 
+// --- importFootage --- (new: the bridge had no way to get external files into
+// the project at all — no image, audio, or video could be brought in through
+// MCP. Imports a file and, if compName is given, adds it as a layer.)
+function importFootage(args) {
+    try {
+        var filePath = args.filePath;
+        if (!filePath) { throw new Error("filePath is required"); }
+        var compName = args.compName || "";
+        var startTime = args.startTime || 0;
+        var file = new File(filePath);
+        if (!file.exists) { throw new Error("File does not exist: " + filePath); }
+
+        var importOptions = new ImportOptions(file);
+        var footageItem = app.project.importFile(importOptions);
+        if (args.name) { footageItem.name = args.name; }
+
+        var layerIndex = null;
+        if (compName) {
+            var comp = null;
+            for (var i = 1; i <= app.project.numItems; i++) {
+                var item = app.project.item(i);
+                if (item instanceof CompItem && item.name === compName) { comp = item; break; }
+            }
+            if (!comp) { throw new Error("No composition found with name '" + compName + "'"); }
+            var newLayer = comp.layers.add(footageItem);
+            newLayer.startTime = startTime;
+            layerIndex = newLayer.index;
+        }
+
+        return JSON.stringify({
+            status: "success", message: "Footage imported successfully",
+            footage: {
+                id: footageItem.id, name: footageItem.name,
+                width: footageItem.width, height: footageItem.height,
+                duration: footageItem.duration, hasAudio: !!footageItem.hasAudio
+            },
+            layerIndex: layerIndex
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// --- evalScript --- (generic escape hatch: runs an arbitrary ExtendScript
+// snippet and returns its result. The bridge otherwise only exposes a fixed,
+// hand-written list of AE operations, so any capability outside that list
+// needs a new named function, a rebuild, and a panel reopen before it can be
+// used — unworkable against an object model as large as AE's. This grants
+// full local script/file access equivalent to running an ExtendScript file
+// directly in After Effects; expose it only to trusted callers.)
+function evalScript(args) {
+    var raw;
+    try {
+        var code = args.code;
+        if (!code) { throw new Error("code is required"); }
+        raw = eval(code);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+    try {
+        return JSON.stringify({ status: "success", result: (raw === undefined ? null : raw) }, null, 2);
+    } catch (stringifyError) {
+        // raw wasn't JSON-serializable (e.g. a native AE object reference) —
+        // fall back to its string form rather than fail the whole call.
+        try {
+            return JSON.stringify({ status: "success", result: String(raw) }, null, 2);
+        } catch (e2) {
+            return JSON.stringify({ status: "success", result: "[unserializable result]" }, null, 2);
+        }
+    }
+}
+
+// --- moveLayer --- (new: nothing in the bridge could reorder the layer stack —
+// needed to send a background solid, added on top by default, behind existing
+// layers.)
+function moveLayer(args) {
+    try {
+        var compName = args.compName || "";
+        var layerName = args.layerName || "";
+        var layerIndex = args.layerIndex;
+        var comp = null;
+        for (var i = 1; i <= app.project.numItems; i++) {
+            var item = app.project.item(i);
+            if (item instanceof CompItem && item.name === compName) { comp = item; break; }
+        }
+        if (!comp) {
+            if (app.project.activeItem instanceof CompItem) { comp = app.project.activeItem; }
+            else { throw new Error("No composition found with name '" + compName + "' and no active composition"); }
+        }
+        var layer = null;
+        if (layerIndex !== undefined && layerIndex !== null) {
+            if (layerIndex > 0 && layerIndex <= comp.numLayers) { layer = comp.layer(layerIndex); }
+            else { throw new Error("Layer index out of bounds: " + layerIndex); }
+        } else if (layerName) {
+            for (var j = 1; j <= comp.numLayers; j++) {
+                if (comp.layer(j).name === layerName) { layer = comp.layer(j); break; }
+            }
+        }
+        if (!layer) { throw new Error("Layer not found: " + (layerName || "index " + layerIndex)); }
+
+        var position = args.position || "toEnd"; // "toBeginning" | "toEnd"
+        if (position === "toBeginning") { layer.moveToBeginning(); } else { layer.moveToEnd(); }
+
+        return JSON.stringify({
+            status: "success", message: "Layer moved successfully",
+            layer: { name: layer.name, index: layer.index }
+        }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 // --- setLayerProperties (modified to handle text properties) ---
 function setLayerProperties(args) {
     try {
@@ -622,6 +734,22 @@ function setLayerProperties(args) {
             changedProperties.push("rotation");
         }
         if (opacity !== undefined && opacity !== null) { layer.property("Opacity").setValue(opacity); changedProperties.push("opacity"); }
+        // Quality / resampling: needed to force Bicubic instead of AE's default
+        // Bilinear when scaling a layer up, so upscaled stills don't look soft.
+        if (args.quality !== undefined && args.quality !== null) {
+            var qMap = { best: LayerQuality.BEST, draft: LayerQuality.DRAFT, wireframe: LayerQuality.WIREFRAME };
+            var q = qMap[String(args.quality).toLowerCase()];
+            if (q !== undefined) { layer.quality = q; changedProperties.push("quality"); }
+        }
+        if (args.samplingQuality !== undefined && args.samplingQuality !== null) {
+            try {
+                var sqMap = { bilinear: SamplingQuality.BILINEAR, bicubic: SamplingQuality.BICUBIC };
+                var sq = sqMap[String(args.samplingQuality).toLowerCase()];
+                if (sq !== undefined) { layer.samplingQuality = sq; changedProperties.push("samplingQuality"); }
+            } catch (e) {
+                logToPanel("Warning: could not set samplingQuality on layer '" + layer.name + "': " + e.toString());
+            }
+        }
         if (startTime !== undefined && startTime !== null) { layer.startTime = startTime; changedProperties.push("startTime"); }
         if (duration !== undefined && duration !== null && duration > 0) {
             var actualStartTime = (startTime !== undefined && startTime !== null) ? startTime : layer.startTime;
@@ -1384,8 +1512,11 @@ if (isAE2025OrLater) {
 var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
 autoRunCheckbox.value = true;
 
-// Check interval (ms)
-var checkInterval = 2000;
+// Check interval (ms) — kept fairly slow on purpose: AE's engine refuses to run
+// ANY scheduled script while a modal dialog is open anywhere, and throws its own
+// "Unable to execute script" alert when the timer collides with one. A longer
+// interval reduces how often a lingering dialog (crash reporter, etc.) gets hit.
+var checkInterval = 5000;
 var isChecking = false;
 
 // Resolve the shared bridge folder. Honors the AE_MCP_BRIDGE_DIR environment variable
@@ -1414,7 +1545,7 @@ function getCommandFilePath() {
     return getBridgeFolder().fsName + "/ae_command.json";
 }
 
-// Result file path - use Documents folder for reliable access
+// Result file path - use the OS temp folder (see getCommandFilePath above)
 function getResultFilePath() {
     return getBridgeFolder().fsName + "/ae_mcp_result.json";
 }
@@ -1617,6 +1748,11 @@ function executeCommand(command, args, commandId) {
                 result = createSolidLayer(args);
                 logToPanel("Returned from createSolidLayer.");
                 break;
+            case "importFootage":
+                logToPanel("Calling importFootage function...");
+                result = importFootage(args);
+                logToPanel("Returned from importFootage.");
+                break;
             case "setLayerProperties":
                 logToPanel("Calling setLayerProperties function...");
                 result = setLayerProperties(args);
@@ -1671,6 +1807,16 @@ function executeCommand(command, args, commandId) {
                 logToPanel("Calling deleteLayer function...");
                 result = deleteLayer(args);
                 logToPanel("Returned from deleteLayer.");
+                break;
+            case "moveLayer":
+                logToPanel("Calling moveLayer function...");
+                result = moveLayer(args);
+                logToPanel("Returned from moveLayer.");
+                break;
+            case "evalScript":
+                logToPanel("Calling evalScript function...");
+                result = evalScript(args);
+                logToPanel("Returned from evalScript.");
                 break;
             case "setLayerMask":
                 logToPanel("Calling setLayerMask function...");
@@ -1849,9 +1995,15 @@ function checkForCommands() {
     isChecking = false;
 }
 
-// Set up timer to check for commands
+// Set up timer to check for commands. Self-rescheduling one-shot rather than
+// app.scheduleTask's own repeat:true — AE's engine refuses to run ANY
+// scheduled script while a modal dialog is open anywhere (throws its own
+// "Unable to execute script" alert, which is itself a new hidden modal), and
+// it's unconfirmed whether the built-in repeating timer keeps retrying
+// cleanly after a failed tick or stops silently. Re-arming explicitly from
+// inside each successful tick removes that uncertainty either way.
 function startCommandChecker() {
-    app.scheduleTask("checkForCommands()", checkInterval, true);
+    app.scheduleTask("checkForCommands(); startCommandChecker();", checkInterval, false);
 }
 
 // Add manual check button
